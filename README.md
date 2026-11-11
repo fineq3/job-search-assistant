@@ -1,155 +1,63 @@
-[English](./README.en.md) | **简体中文**
+# 招聘信息助手
 
-# RAG 知识库问答系统
+上传招聘 Markdown、TXT 或 PDF 后，可以查询岗位细节、比较不同公司的要求，也可以用自然语言筛选结构化岗位。
 
-> 把任意文档（txt / md / pdf）变成一个**只依据你的资料回答、不瞎编**的 AI 问答机器人。
-> 上传一份手册 → 提问 → AI 基于文档内容作答并标注来源；问到资料外的内容，会老实回答「无法回答」。
+这是面向求职场景的本地演示项目。完整流程、技术边界及验收记录见 [项目交付说明](docs/项目交付说明.md)。
 
-![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)
-![DeepSeek](https://img.shields.io/badge/LLM-DeepSeek-4D6BFE)
-![Embedding](https://img.shields.io/badge/Embedding-bge--small--zh-FF6F00)
-![Vector DB](https://img.shields.io/badge/VectorDB-Chroma-5A4FCF)
-![License](https://img.shields.io/badge/License-MIT-green)
+![岗位筛选与资料缺失时的回答](docs/demo-v1.jpg)
 
-**适用场景**：企业知识库问答、智能客服、产品手册 / 操作文档问答、公司内部制度问答。
+| 用户问题 | 查询方式 |
+| --- | --- |
+| 睿联技术的嵌入式软件开发工程师在哪个城市，招哪一届？ | BGE 生成向量，Chroma 检索文档，DeepSeek 依据检索片段回答 |
+| 筛选合肥实习时长不超过 3 个月的岗位 | DeepSeek 生成 `search_jobs` 的筛选参数，FastAPI 执行参数化 SQLite 查询，再把结果交给模型整理 |
 
----
+网页支持批量上传、展开检索片段、显示 SQLite 筛选结果。当前的 32 份样例包括 30 份招聘公告快照和 2 份实习岗位说明。每份匹配格式的 Markdown 对应一条 SQLite 记录。公告列出多个岗位和地点时，记录保留原文与对应关系说明。
 
-## 核心特性
+## 本地启动
 
-落地 AI 客服最怕两件事：**答不准** 和 **一本正经地胡说八道**。本项目用 RAG（检索增强生成）正面解决这两点：
+需要 [uv](https://docs.astral.sh/uv/getting-started/installation/) 和满足 [前端 package.json](frontend/package.json) 中 `engines.node` 要求的 Node.js。uv 可以为项目准备 Python 3.12。
 
-| 特性 | 做法 | 价值 |
-| --- | --- | --- |
-| **答得准（带来源）** | 先在文档里检索最相关的段落，再让大模型据此回答，并把依据的来源段落 + 相关度一起返回 | 答案可追溯、可核对，不是黑盒 |
-| **不瞎编（资料外答"无法回答"）** | 系统提示强制「只能依据参考资料回答，资料里没有就如实说不知道」，并配合低温度采样 | 杜绝幻觉，可放心接入客服场景 |
+在项目根目录新建 `.env`，设置 `DEEPSEEK_API_KEY`。模型默认使用 `deepseek-flash`，可以用 `DEEPSEEK_MODEL` 指定支持工具调用的 DeepSeek 模型。[DeepSeek 工具调用文档](https://api-docs.deepseek.com/guides/tool_calls/)
 
-### 问内 vs 问外：同一份文档的不同表现
+在项目根目录运行以下 PowerShell 命令。
 
-以示例文档《星辰科技员工手册》为例：
-
-| 提问 | 文档里有吗 | 表现 |
-| --- | --- | --- |
-| 「年假有几天？」 | ✅ 有 | 准确回答，并标注来源段落与相关度 |
-| 「报销超过多少要部门负责人审批？」 | ✅ 有 | 准确回答具体金额阈值 |
-| 「公司在哪上市？」 | ❌ 没有 | 回答「根据现有资料，我无法回答这个问题。」 |
-| 「CEO 的薪资是多少？」 | ❌ 没有 | 拒绝编造，明确说明资料中无相关信息 |
-
----
-
-## 演示
-
-![演示](docs/demo.gif)
-
-1. 上传 `示例文档-星辰科技员工手册.md`，左侧「已入库文档」刷新。
-2. 提问文档内的问题（如「年假有几天？」）：返回准确答案，并在下方标注来源段落与相关度。
-3. 提问文档外的问题（如「公司在哪上市？」）：返回「根据现有资料，我无法回答这个问题。」
-
----
-
-## 架构 / RAG 流程
-
-```mermaid
-flowchart LR
-    subgraph 建库["① 建库（上传文档时）"]
-        A[原始文档<br/>txt / md / pdf] --> B[切分 chunk<br/>400 字 + 80 重叠]
-        B --> C[本地 Embedding<br/>bge-small-zh]
-        C --> D[(Chroma<br/>向量库)]
-    end
-    subgraph 问答["② 问答（用户提问时）"]
-        Q[用户问题] --> QE[问题向量化]
-        QE --> R[向量检索<br/>余弦相似度 Top-K]
-        D --> R
-        R --> P[拼接参考资料 + 问题]
-        P --> LLM[DeepSeek<br/>据资料作答]
-        LLM --> ANS[答案 + 来源段落 + 相关度]
-    end
-```
-
----
-
-## 快速开始
-
-### 1. 准备 DeepSeek Key
-
-去 [platform.deepseek.com](https://platform.deepseek.com/) 创建 API key。把 `.env.example` 复制成 `.env`，填入 key：
-
-```bash
-cp .env.example .env
-# 编辑 .env：DEEPSEEK_API_KEY=sk-你的key
-```
-
-### 2. 装依赖 + 启动（uv）
-
-```bash
+```powershell
 uv venv --python 3.12
-uv pip install -r requirements.txt
-uv run uvicorn app.main:app --reload
+uv pip install --python .\.venv\Scripts\python.exe -r requirements-lock.txt
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-> 首次启动会自动下载 embedding 模型（约 100MB）。
+已有 `.venv` 时可以从安装依赖的命令开始。首次启动会加载本地 BGE 模型，缓存缺失时会下载模型。构建完成后，FastAPI 在 [http://127.0.0.1:8000](http://127.0.0.1:8000) 提供 Vue 页面。开发时可另开终端运行 `npm.cmd --prefix frontend run dev`，由 Vite 代理 API。
 
-### 3. 打开浏览器
+环境准备完成后，日常可双击根目录的 `start.cmd`，等窗口显示 `Application startup complete` 后打开网页。保持窗口开启，按 `Ctrl+C` 停止。已有服务占用 8000 端口时，直接使用现有页面，不要重复启动。修改前端后需重新构建并重启服务。
 
-访问 <http://127.0.0.1:8000>，上传 `示例文档-星辰科技员工手册.md` 后即可提问。
+`requirements-lock.txt` 是本机 Windows / Python 3.12 的已安装版本快照，包含测试依赖；未验证其他操作系统。`requirements.txt` 保留直接依赖列表。若 `uv` 不在 PATH，使用已安装 uv 的系统 Python 执行 `python -m uv` 替代；不要在未安装 uv 的虚拟环境中执行该替代命令。
 
----
+## 演示步骤
 
-## 工程说明：本地 Embedding + 国内镜像
+1. 在页面批量上传 [samples](samples) 下的 Markdown。全新知识库导入 32 份后，左侧会列出对应文件。上传同名文件会更新索引。
+2. 问「睿联技术的嵌入式软件开发工程师在哪个城市，招哪一届？」。预期回答深圳、2027 届，可展开检索片段核对。
+3. 问「筛选合肥的实习岗位，实习时长不超过 3 个月」。预期只返回美的冰箱事业部，实习 3 个月、每周 4 天。也可以在 [FastAPI 接口文档](http://127.0.0.1:8000/docs) 中直接试用 `GET /api/jobs`。
+4. 问「美的冰箱事业部这个 AI 实习岗位提供住宿吗？」。预期提示资料未提供或无法确认。
 
-- **本地 Embedding（`bge-small-zh-v1.5`）**：向量化在本机完成，无需为每段文字调用付费 Embedding API，省成本、数据不出本地（知识库常涉及内部资料，对数据外发敏感）；中文检索效果也优于多数通用英文模型。
-- **国内镜像（`hf-mirror.com`）**：直连 `huggingface.co` 下载模型常超时失败，代码在 import `transformers` **之前**设置 `HF_ENDPOINT` 走镜像（顺序很关键，晚了不生效）。
+`app/rag.py` 负责 Chroma 检索和 DeepSeek 调用，`app/jobs.py` 负责从岗位 Markdown 提取字段并查询 SQLite，`frontend/src/App.vue` 负责上传和结果展示。SQLite 在启动、上传和清空时与当前 Chroma 集合中的文档同步。上传文件、向量库和 SQLite 数据库保存在本地 `data` 目录。
 
----
+结构化筛选依赖 Markdown 中可提取的字段。实习时长未注明的记录不会匹配时长上限。样例的招聘状态是采集时的记录，投递前以官方渠道为准。
 
-## 目录结构
+## 验证与演示资料
 
-```text
-rag-demo/
-├── app/
-│   ├── main.py            # FastAPI 接口 + 托管前端
-│   ├── rag.py             # RAG 核心：切分 → 向量化 → 检索 → 生成
-│   └── static/index.html  # 前端页面（原生 HTML/JS，无需构建）
-├── data/
-│   ├── docs/              # 上传的原始文档
-│   └── chroma/            # 向量库（自动生成）
-├── 示例文档-星辰科技员工手册.md
-├── requirements.txt
-├── .env.example
-├── LICENSE
-└── README.md
+在根目录运行 `verify.cmd`，执行离线回归测试及 Vue 类型检查、生产构建。测试使用临时数据库和替代模型，不修改日常知识库，不调用付费 API。
+
+服务启动且已导入样例后，可运行下面的真实问答检查。它会正常消耗已配置 DeepSeek API 的额度，结果保存到本地 `data/reports/demo-evaluation.json`，不进入 Git。
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_demo.py
 ```
 
-## 技术栈
+上传限制为单文件 10 MB。TXT / Markdown 使用 UTF-8 编码，PDF 需有可提取文本；扫描版需先 OCR。清空功能删除当前 Chroma 与 SQLite 索引，保留 `data/docs` 下原始文件和 `samples` 样例。重启不会自动重新导入已清空的资料。聊天记录仅在当前页面保留。
 
-| 层 | 选型 | 说明 |
-| --- | --- | --- |
-| 后端 | **FastAPI** | 轻量异步 Web 框架，自带 OpenAPI 文档 |
-| 大模型 | **DeepSeek**（`deepseek-chat`） | 通过 OpenAI 兼容接口调用，生成最终答案 |
-| Embedding | **bge-small-zh-v1.5**（本地） | 中文语义向量化，免 API key、数据不出本地 |
-| 向量库 | **Chroma**（本地持久化） | 文件形式存盘，无需单独部署数据库服务 |
-| 前端 | 原生 HTML / JS | 单文件页面，零构建依赖 |
+模型只获得问题、检索片段或查询结果。网页不接触 API 密钥。请仅在本机运行本演示服务；尚未实现登录、用户隔离或公网部署。
 
-## 可拓展方向
-
-- 接入微信公众号 / 企业微信 / 飞书机器人
-- 支持更多格式：Word、Excel、网页抓取
-- 多轮对话记忆与对话历史
-- 来源高亮，跳转回原文位置
-- 流式输出（SSE）、检索重排序（rerank）提升精度
-
----
-
-## English Summary
-
-A **RAG (Retrieval-Augmented Generation)** knowledge-base Q&A system.
-Upload any `txt / md / pdf` document, then ask questions — the assistant answers **strictly based on your documents** and **cites the source passages it relied on**. When the answer is not in the documents, it honestly replies "I cannot answer based on the available material" instead of hallucinating.
-
-Stack: **FastAPI** + **DeepSeek** (LLM) + local **bge-small-zh** embeddings + **Chroma** vector store. Embeddings run locally (no per-call cost, data stays on-prem), with a domestic Hugging Face mirror configured for reliable model download in mainland China.
-
----
-
-## License
-
-[MIT](./LICENSE) © Sunruising
+本项目基于 [Sunruising/rag-knowledge-base-qa](https://github.com/Sunruising/rag-knowledge-base-qa) 改造，按 [MIT 许可证](LICENSE) 分发。[上游英文说明](README.en.md)
