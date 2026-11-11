@@ -1,4 +1,4 @@
-**English** | [简体中文](./README.md)
+> **Historical upstream documentation.** This file preserves the original project's description and demo. Its capabilities, guarantees and setup commands do not describe the current fork. See the [current project README](../../README.md) for supported behavior, setup and limitations.
 
 # RAG Knowledge-Base Q&A System
 
@@ -40,7 +40,7 @@ Using the sample document *Stellar Tech Employee Handbook* as an example:
 
 ## Demo
 
-![demo](docs/demo.gif)
+![Original upstream demo](demo.gif)
 
 1. Upload `示例文档-星辰科技员工手册.md`; the "Indexed documents" list on the left refreshes.
 2. Ask an in-document question (e.g. "How many days of annual leave?"): get an accurate answer, with the source passage and relevance score shown below.
@@ -143,4 +143,4 @@ rag-demo/
 
 ## License
 
-[MIT](./LICENSE) © Sunruising
+[MIT](../../LICENSE) © Sunruising

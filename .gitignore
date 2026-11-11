@@ -1,10 +1,22 @@
+# Python environment and caches
 .venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local credentials (keep the public template)
 .env
+.env.*
+!.env.example
+
+# Generated knowledge-base data and local reports
 data/chroma/
 data/jobs.sqlite3*
 data/reports/
 data/docs/*
 !data/docs/.gitkeep
-__pycache__/
-*.pyc
+# Editor / OS temporary files
+.idea/
 .DS_Store
+Thumbs.db
