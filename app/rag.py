@@ -11,10 +11,14 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 import uuid
 from pathlib import Path
 from threading import RLock
+from typing import Literal, TypedDict
 
 import chromadb
 import torch
-from openai import OpenAI
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_deepseek import ChatDeepSeek
+from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from pydantic import ValidationError
 from transformers import AutoModel, AutoTokenizer
 
@@ -41,6 +45,19 @@ SEARCH_JOBS_TOOL = {
         "parameters": JobFilters.model_json_schema(),
     },
 }
+
+
+class AnswerState(TypedDict, total=False):
+    question: str
+    hits: list[dict]
+    reply: AIMessage
+    tool_results: list[ToolMessage]
+    matched_jobs: list[dict]
+    response: dict
+
+
+class AnswerContext(TypedDict):
+    jobs: JobStore
 
 
 class LLMConfigurationError(RuntimeError):
@@ -84,15 +101,25 @@ class RagEngine:
             metadata={"hnsw:space": "cosine"},  # 用余弦相似度衡量"语义接近程度"
         )
 
-        # DeepSeek 用 OpenAI 兼容接口，延迟创建：没 key 时也能用上传/检索，调用时才报错
+        # 有问题需要生成答案时才初始化 DeepSeek，上传和检索不需要密钥。
         self._llm = None
+        self.answer_graph = self._build_answer_graph()
 
-    def _get_llm(self) -> OpenAI:
+    def _get_llm(self) -> ChatDeepSeek:
         if self._llm is None:
             key = os.environ.get("DEEPSEEK_API_KEY")
-            if not key or key.strip() == "your_deepseek_api_key":
+            if not key or not key.strip() or key.strip() == "your_deepseek_api_key":
                 raise LLMConfigurationError("未配置 DEEPSEEK_API_KEY，请在项目根目录 .env 填入后重启服务")
-            self._llm = OpenAI(api_key=key, base_url="https://api.deepseek.com", timeout=35.0, max_retries=0)
+            self._llm = ChatDeepSeek(
+                model=DEEPSEEK_MODEL,
+                api_key=key,
+                api_base="https://api.deepseek.com",
+                temperature=0.2,
+                max_tokens=800,
+                timeout=35.0,
+                max_retries=0,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
         return self._llm
 
     # ---------- 1. 切分 ----------
@@ -172,16 +199,42 @@ class RagEngine:
 
     # ---------- 5. 生成 ----------
     def answer(self, question: str, jobs: JobStore) -> dict:
-        hits = self.retrieve(question)
-        if not hits:
-            return {
-                "answer": "知识库还是空的，请先上传文档。",
-                "sources": [],
-                "mode": "rag",
-            }
+        return self.answer_graph.invoke({"question": question}, context={"jobs": jobs})["response"]
 
+    def _build_answer_graph(self):
+        graph = StateGraph(AnswerState, context_schema=AnswerContext)
+        graph.add_node("retrieve", self._retrieve_for_answer)
+        graph.add_node("empty_knowledge_base", self._empty_knowledge_base)
+        graph.add_node("ask_model", self._ask_model)
+        graph.add_node("finish_rag", self._finish_rag)
+        graph.add_node("search_jobs", self._execute_job_tools)
+        graph.add_node("summarize_jobs", self._summarize_jobs)
+        graph.add_edge(START, "retrieve")
+        graph.add_conditional_edges("retrieve", self._route_retrieval)
+        graph.add_conditional_edges("ask_model", self._route_model_reply)
+        graph.add_edge("search_jobs", "summarize_jobs")
+        for node in ("empty_knowledge_base", "finish_rag", "summarize_jobs"):
+            graph.add_edge(node, END)
+        return graph.compile()
+
+    def _retrieve_for_answer(self, state: AnswerState) -> AnswerState:
+        return {"hits": self.retrieve(state["question"])}
+
+    @staticmethod
+    def _route_retrieval(state: AnswerState) -> Literal["ask_model", "empty_knowledge_base"]:
+        return "ask_model" if state["hits"] else "empty_knowledge_base"
+
+    @staticmethod
+    def _empty_knowledge_base(_state: AnswerState) -> AnswerState:
+        return {"response": {
+            "answer": "知识库还是空的，请先上传文档。",
+            "sources": [],
+            "mode": "rag",
+        }}
+
+    def _ask_model(self, state: AnswerState) -> AnswerState:
         context = "\n\n".join(
-            f"【资料{i+1}·来自 {h['source']}】\n{h['text']}" for i, h in enumerate(hits)
+            f"【资料{i+1}·来自 {h['source']}】\n{h['text']}" for i, h in enumerate(state["hits"])
         )
 
         system_prompt = (
@@ -194,73 +247,79 @@ class RagEngine:
             "招聘状态以样例中的记录为准，说明实时状态需到官方渠道核对。"
             "使用简洁中文纯文本。"
         )
-        user_prompt = f"【参考资料】\n{context}\n\n【用户问题】\n{question}"
+        user_prompt = f"【参考资料】\n{context}\n\n【用户问题】\n{state['question']}"
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
         ]
-        reply = self._chat(messages, tool_choice="auto")
-        if reply.tool_calls:
-            return self._answer_with_jobs(question, reply, jobs)
+        return {"reply": self._chat(messages, tool_choice="auto")}
 
-        return {
-            "answer": reply.content or "根据现有资料，我无法回答这个问题。",
+    @staticmethod
+    def _route_model_reply(state: AnswerState) -> Literal["search_jobs", "finish_rag"]:
+        reply = state["reply"]
+        return "search_jobs" if reply.tool_calls or reply.invalid_tool_calls else "finish_rag"
+
+    @staticmethod
+    def _finish_rag(state: AnswerState) -> AnswerState:
+        return {"response": {
+            "answer": state["reply"].text or "根据现有资料，我无法回答这个问题。",
             "mode": "rag",
             "sources": [
-                {"source": h["source"], "score": h["score"], "snippet": h["text"]}
-                for h in hits
+                {"source": hit["source"], "score": hit["score"], "snippet": hit["text"]}
+                for hit in state["hits"]
             ],
-        }
+        }}
 
-    def _chat(self, messages: list[dict], tool_choice: str):
-        response = self._get_llm().chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=messages,
-            tools=[SEARCH_JOBS_TOOL],
-            tool_choice=tool_choice,
-            extra_body={"thinking": {"type": "disabled"}},
-            temperature=0.2,
-            max_tokens=800,
-        )
-        return response.choices[0].message
+    def _chat(self, messages: list[BaseMessage], tool_choice: Literal["auto", "none"]) -> AIMessage:
+        model = self._get_llm().bind_tools([SEARCH_JOBS_TOOL], tool_choice=tool_choice)
+        return model.invoke(messages)
 
-    def _answer_with_jobs(self, question: str, reply, jobs: JobStore) -> dict:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "你是招聘信息助手。仅依据 search_jobs 的结果，用简洁中文纯文本回答。"
-                    "只列出匹配结果，有地点对应关系不明确的说明就保留。"
-                    "无匹配时说明当前样例未找到，查询失败时如实说明。"
-                    "truncated 为 true 时提示结果仅显示前 50 条。"
-                ),
-            },
-            {"role": "user", "content": question},
-        ]
-        messages.append(reply.model_dump(include={"role", "content", "tool_calls"}, exclude_none=True))
+    @staticmethod
+    def _execute_job_tools(state: AnswerState, runtime: Runtime[AnswerContext]) -> AnswerState:
+        reply = state["reply"]
+        jobs = runtime.context["jobs"]
         matches = {}
+        tool_results = []
+        invalid_filters = {"error": "筛选条件格式无效，请提示用户确认条件"}
         for call in reply.tool_calls:
-            if call.type != "function" or call.function.name != "search_jobs":
+            if call["name"] != "search_jobs":
                 result = {"error": "工具不可用"}
             else:
                 try:
-                    filters = JobFilters.model_validate_json(call.function.arguments, strict=True)
+                    filters = JobFilters.model_validate(call["args"], strict=True)
+                except ValidationError:
+                    result = invalid_filters
+                else:
                     result = jobs.search(filters)
                     matches.update((row["source"], row) for row in result["jobs"])
-                except ValidationError:
-                    result = {"error": "筛选条件格式无效，请提示用户确认条件"}
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+            tool_results.append(ToolMessage(
+                tool_call_id=call["id"], content=json.dumps(result, ensure_ascii=False),
+            ))
+        for call in reply.invalid_tool_calls:
+            tool_results.append(ToolMessage(
+                tool_call_id=call["id"], content=json.dumps(invalid_filters, ensure_ascii=False),
+            ))
+        return {"tool_results": tool_results, "matched_jobs": list(matches.values())}
+
+    def _summarize_jobs(self, state: AnswerState) -> AnswerState:
+        messages = [
+            SystemMessage(content=(
+                "你是招聘信息助手。仅依据 search_jobs 的结果，用简洁中文纯文本回答。"
+                "只列出匹配结果，有地点对应关系不明确的说明就保留。"
+                "无匹配时说明当前样例未找到，查询失败时如实说明。"
+                "truncated 为 true 时提示结果仅显示前 50 条。"
+            )),
+            HumanMessage(content=state["question"]),
+            state["reply"],
+            *state["tool_results"],
+        ]
         final = self._chat(messages, tool_choice="none")
-        return {
-            "answer": final.content or "请查看下方筛选结果。",
+        return {"response": {
+            "answer": final.text or "请查看下方筛选结果。",
             "mode": "jobs",
-            "jobs": list(matches.values()),
+            "jobs": state["matched_jobs"],
             "sources": [],
-        }
+        }}
 
     # ---------- 辅助 ----------
     def status(self) -> dict:

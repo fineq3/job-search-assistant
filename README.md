@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>从一份招聘资料，到一个有依据的回答。</strong><br />
-  基于 RAG 与工具调用的招聘信息助手 · 本地运行 · Vue + FastAPI
+  基于 RAG 与工具调用的招聘信息助手 · Vue + FastAPI + LangChain + LangGraph
 </p>
 
 <p align="center">
@@ -65,20 +65,30 @@
 
 ## 工作原理
 
-**语义问题用 RAG 查资料，明确条件用 SQL 筛记录。** 向量检索能找到相关文本，数值边界则交给数据库判断。
+上传时，BGE 将文档切片转成向量，Chroma 保存向量与原文片段。符合约定格式的 Markdown 还会建立 SQLite 索引，供岗位筛选使用。
+
+提问时，FastAPI 将请求交给 LangGraph 的 `StateGraph`。图先检索 Chroma，再根据 LangChain 返回的 DeepSeek 消息选择下一步。
 
 ```mermaid
-flowchart LR
-    Q[用户提问] --> R[本地 BGE + Chroma 检索]
-    R --> L[DeepSeek 接收问题与参考片段]
-    L -->|详情或对比| A[答案 + 检索来源]
-    L -->|条件筛选| T[search_jobs 参数校验]
-    T --> S[(SQLite 参数化查询)]
-    S --> G[DeepSeek 整理查询结果]
-    G --> C[答案 + 岗位卡片]
+flowchart TD
+    Q["用户提问 /api/ask"] --> R["BGE 编码 + Chroma 检索"]
+    R -->|知识库为空| E["提示上传资料"]
+    R -->|检索到片段| L["LangChain 第一次调用 DeepSeek<br/>传入问题、检索片段和工具定义"]
+    L --> D{"模型请求调用工具？"}
+    D -->|否| A["返回文字回答和检索来源"]
+    D -->|是| T{"工具名与参数校验通过？"}
+    T -->|是| S["后端执行 SQLite 参数化查询"]
+    T -->|否| F["生成工具错误结果"]
+    S --> G["LangChain 第二次调用 DeepSeek<br/>根据工具结果生成文字"]
+    F --> G
+    G --> C["返回文字和结构化岗位数据"]
 ```
 
-上传时，文档会经过文本提取、切片和 BGE 向量化后存入 Chroma；符合约定字段格式的 Markdown 同时建立 SQLite 索引。模型产生工具调用参数，**实际查询由后端执行**。工具结果生成阶段不再混入原来的 RAG 片段，减少不匹配岗位被带入答案的问题。
+- **LangChain** 用 `ChatDeepSeek.bind_tools()` 绑定 `search_jobs` 的定义，通过 `invoke()` 发起模型请求。
+- **LangGraph** 用条件边处理空知识库、普通问答和工具调用。工具分支只执行一轮，第二次模型请求设置 `tool_choice="none"`。
+- **后端** 用 Pydantic 严格校验参数，再查 SQLite。第二次模型请求使用用户问题和工具调用记录、工具结果。Vue 根据后端返回的结构化岗位数据渲染卡片。
+
+流程节点和条件边见 [app/rag.py](app/rag.py)。
 
 | 层级 | 使用的技术 | 作用 |
 | --- | --- | --- |
@@ -86,7 +96,8 @@ flowchart LR
 | 接口 | FastAPI · Pydantic | 请求处理、字段校验与前端托管 |
 | 检索 | 本地 BGE · Chroma | 中文文本向量化与语义召回 |
 | 筛选 | SQLite | 城市、关键词、类型、实习月数及出勤天数上限筛选 |
-| 生成 | DeepSeek | 依据资料回答、选择工具、整理查询结果 |
+| 生成 | LangChain · DeepSeek | 绑定工具定义，调用模型回答和整理结果 |
+| 编排 | LangGraph | 管理检索、问答与工具分支 |
 
 <details>
 <summary><strong>展开查看：关键实现参数</strong></summary>
@@ -126,7 +137,7 @@ npm.cmd --prefix frontend ci
 npm.cmd --prefix frontend run build
 ```
 
-已有虚拟环境时跳过第一行。Python 版本快照记录在 `requirements-lock.txt`，前端依赖由 `package-lock.json` 锁定；其他操作系统尚未验证。
+已有虚拟环境时跳过第一行。更新旧版本后，重新执行 Python 依赖安装命令，再重启服务。Python 和前端依赖分别记录在 `requirements-lock.txt` 和 `package-lock.json`。
 
 ### 3. 启动与使用
 
@@ -153,7 +164,7 @@ npm.cmd --prefix frontend run build
 
 ## 验证结果
 
-以下为 **2026-11-11 的功能验收记录**，不是持续集成状态或大规模准确率评估。
+离线测试、真实问答和前端构建于 **2026-11-13** 在 LangChain / LangGraph 版本复验。页面验收来自 **2026-11-11**。这些检查用于功能验收。
 
 | 检查 | 结果 | 覆盖范围 |
 | --- | --- | --- |
@@ -170,7 +181,7 @@ npm.cmd --prefix frontend run build
 .\.venv\Scripts\python.exe scripts\evaluate_demo.py
 ```
 
-真实问答报告保存在本地 `data/reports/demo-evaluation.json`。离线测试使用临时数据库和替代模型，不改动日常知识库。详细说明见[验收记录](docs/项目交付说明.md#验收结果)。
+运行上述评估脚本后，真实问答报告保存在本地 `data/reports/demo-evaluation.json`。离线测试使用临时数据库和替代模型，不改动日常知识库。详细说明见[验收记录](docs/项目交付说明.md#验收结果)。
 
 ## 仓库导航
 
@@ -215,6 +226,7 @@ job-search-assistant/
 | 基础上传、切片、BGE、Chroma 与 DeepSeek 问答 | 招聘资料整理及结构化字段索引 |
 | 原生 HTML 页面 | Vue / TypeScript 迁移与批量上传 |
 | 基础检索结果展示 | 工具调用筛选、结果卡片、来源展开及异常提示 |
+| Python 问答流程 | 用 LangChain 接入 DeepSeek，并以 LangGraph 编排检索、分流与结果生成 |
 | 基础运行示例 | 回归测试、真实问答验证、启动脚本与交付文档 |
 
 实现过程中使用 AI 辅助。[上游历史说明](docs/archive/README.upstream.en.md)仅用于保留来源记录；当前功能与运行方式以本 README 为准。

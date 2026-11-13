@@ -11,7 +11,8 @@ import chromadb
 import httpx
 from fastapi.testclient import TestClient
 from openai import APITimeoutError
-from openai.types.chat import ChatCompletionMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_deepseek import ChatDeepSeek
 from app import main, rag
 from app.jobs import JobFilters, JobStore
 
@@ -133,36 +134,83 @@ class ProjectTests(unittest.TestCase):
 
     def test_rag_returns_full_passage(self):
         self.upload()
-        with patch.object(self.engine, '_chat', return_value=ChatCompletionMessage(role='assistant', content='未说明住宿。')):
+        with patch.object(self.engine, '_chat', return_value=AIMessage(content='未说明住宿。')):
             result = self.engine.answer('美的提供住宿吗？', main.job_store)
         self.assertEqual(result['mode'], 'rag')
         self.assertTrue(any(len(s['snippet']) > 120 for s in result['sources']))
 
-    def tool_reply(self, name='search_jobs', arguments=None):
-        return ChatCompletionMessage(role='assistant', content=None, tool_calls=[{
-            'id': 'call_test', 'type': 'function', 'function': {
-                'name': name, 'arguments': json.dumps(arguments or {}, ensure_ascii=False)}}])
-
     def test_tool_answer_does_not_mix_nonmatching_rag_passages(self):
         self.upload()
         self.upload(BAOZUN)
-        replies = [self.tool_reply(arguments={'city': '合肥', 'kind': '实习', 'max_duration_months': 3}),
-                   ChatCompletionMessage(role='assistant', content='匹配美的。')]
-        with patch.object(self.engine, '_chat', side_effect=replies) as model:
-            result = self.engine.answer('筛选合肥实习不超过3个月', main.job_store)
+        payloads = []
+
+        def respond(request):
+            self.assertEqual(request.url.path, '/chat/completions')
+            payload = json.loads(request.content)
+            payloads.append(payload)
+            if len(payloads) == 1:
+                message = {'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'id': 'call_test', 'type': 'function', 'function': {
+                        'name': 'search_jobs',
+                        'arguments': json.dumps({'city': '合肥', 'kind': '实习', 'max_duration_months': 3}),
+                    },
+                }]}
+            else:
+                message = {'role': 'assistant', 'content': '匹配美的。'}
+            return httpx.Response(200, json={
+                'id': 'mock_completion', 'object': 'chat.completion', 'created': 0,
+                'model': 'deepseek-flash', 'choices': [{
+                    'index': 0, 'message': message,
+                    'finish_reason': 'tool_calls' if len(payloads) == 1 else 'stop',
+                }],
+            })
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            with patch.object(rag, 'ChatDeepSeek', side_effect=lambda **kwargs: ChatDeepSeek(
+                **{**kwargs, 'api_key': 'offline-test'}, http_client=http,
+            )), patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'offline-test'}):
+                response = self.client.post('/api/ask', json={'question': '筛选合肥实习不超过3个月'})
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result['mode'], 'jobs')
+        self.assertEqual(result['answer'], '匹配美的。')
+        self.assertEqual(result['sources'], [])
         self.assertEqual([j['company'] for j in result['jobs']], ['美的冰箱事业部'])
-        second = json.dumps(model.call_args_list[1].args[0], ensure_ascii=False)
-        self.assertNotIn('宝尊', second)
-        self.assertNotIn('【参考资料】', second)
+
+        first, second = payloads
+        self.assertEqual(first['tool_choice'], 'auto')
+        self.assertEqual(first['tools'][0]['function']['name'], 'search_jobs')
+        self.assertEqual(first['thinking'], {'type': 'disabled'})
+        self.assertIn('【参考资料】', first['messages'][1]['content'])
+        self.assertEqual(second['tool_choice'], 'none')
+        self.assertEqual(second['messages'][-1]['tool_call_id'], 'call_test')
+        sent = json.dumps(second['messages'], ensure_ascii=False)
+        self.assertNotIn('宝尊', sent)
+        self.assertNotIn('【参考资料】', sent)
 
     def test_invalid_tool_calls_cannot_query_database(self):
-        for reply in [self.tool_reply(name='execute_sql'), self.tool_reply(arguments={'max_duration_months': '3'}),
-                      self.tool_reply(arguments={'sql': 'DELETE FROM jobs'})]:
-            with patch.object(main.job_store, 'search') as search, patch.object(self.engine, '_chat',
-                return_value=ChatCompletionMessage(role='assistant', content='请确认条件。')) as model:
-                self.engine._answer_with_jobs('查询岗位', reply, main.job_store)
+        self.upload()
+        calls = [('execute_sql', {}), ('search_jobs', {'max_duration_months': '3'}),
+                 ('search_jobs', {'sql': 'DELETE FROM jobs'})]
+        replies = [AIMessage(content='', tool_calls=[{'id': 'call_test', 'name': name, 'args': args}])
+                   for name, args in calls]
+        replies.append(AIMessage(content='', invalid_tool_calls=[{
+            'id': 'call_test', 'name': 'search_jobs', 'args': '{"unfinished":', 'error': 'invalid JSON',
+        }]))
+        for reply in replies:
+            with self.subTest(reply=reply), patch.object(main.job_store, 'search') as search, patch.object(
+                self.engine, '_chat', side_effect=[reply, AIMessage(content='请确认条件。')],
+            ) as model:
+                result = self.engine.answer('查询岗位', main.job_store)
                 search.assert_not_called()
-                self.assertIn('error', model.call_args.args[0][-1]['content'])
+                self.assertEqual(result['mode'], 'jobs')
+                self.assertEqual(result['jobs'], [])
+                self.assertEqual(model.call_count, 2)
+                self.assertEqual(model.call_args.kwargs['tool_choice'], 'none')
+                tool_message = model.call_args.args[0][-1]
+                self.assertIsInstance(tool_message, ToolMessage)
+                self.assertEqual(tool_message.tool_call_id, 'call_test')
+                self.assertIn('error', json.loads(tool_message.content))
 
 
 if __name__ == '__main__':
